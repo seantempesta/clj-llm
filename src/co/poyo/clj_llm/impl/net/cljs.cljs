@@ -13,6 +13,11 @@
    [clojure.core.async :as a]
    [clojure.string :as str]))
 
+(def ^:private retryable-statuses
+  "HTTP status codes that should trigger a retry: 429 + transient 5xx + 408.
+   Kept in sync with the JVM impl in co.poyo.clj-llm.stream."
+  #{408 429 500 502 503 504})
+
 (defn- ^js text-decoder []
   (js/TextDecoder. "utf-8"))
 
@@ -82,11 +87,16 @@
                          (.then (fn [body-str]
                                   (a/put! out-ch
                                           (ex-info (str "HTTP " status ": " body-str)
-                                                   {:status status :body body-str}))
+                                                   {:status status
+                                                    :body body-str
+                                                    :retryable? (boolean (retryable-statuses status))}))
                                   (a/close! out-ch))))))))
         (.catch (fn [err]
                   (a/put! out-ch
                           (ex-info (str "Fetch error: " (.-message err))
-                                   {:error err}))
+                                   {:error err
+                                    ;; Connection-level errors are typically transient
+                                    ;; (network blip, DNS hiccup) — let the retry layer try again.
+                                    :retryable? true}))
                   (a/close! out-ch))))
     out-ch))

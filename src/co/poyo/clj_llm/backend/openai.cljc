@@ -52,8 +52,9 @@
 
 (defn- normalize-messages [messages]
   (mapv (fn [msg]
-          (cond-> (clojure.set/rename-keys msg {:tool-calls :tool_calls
-                                                :tool-call-id :tool_call_id})
+          (cond-> (clojure.set/rename-keys msg {:tool-calls        :tool_calls
+                                                :tool-call-id      :tool_call_id
+                                                :reasoning-content :reasoning_content})
             (:content msg) (update :content normalize-content)))
         messages))
 
@@ -134,8 +135,19 @@
             tool-calls)
 
       finish-reason
-      (cond-> [{:type :finish :reason finish-reason}]
-        usage (conj (into {:type :usage} usage)))
+      ;; DeepSeek emits finish_reason "insufficient_system_resource" when the
+      ;; backend is under pressure and can't continue. Treat as a retryable
+      ;; error rather than a clean finish so the retry wrapper in core can
+      ;; re-attempt (it will only retry if no content has been emitted yet).
+      (if (= "insufficient_system_resource" finish-reason)
+        (cond-> [{:type :error
+                  :error {:message "DeepSeek backend ran out of resources mid-generation"
+                          :finish-reason finish-reason
+                          :retryable? true
+                          :transient? true}}]
+          usage (conj (into {:type :usage} usage)))
+        (cond-> [{:type :finish :reason finish-reason}]
+          usage (conj (into {:type :usage} usage))))
 
       usage
       [(into {:type :usage} usage)])))

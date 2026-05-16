@@ -51,6 +51,26 @@
    [:temperature {:optional true} number?]
    [:max-tokens {:optional true} :int]
    [:top-p {:optional true} number?]
+   ;; DeepSeek thinking-mode controls (also accepted by some other reasoning models
+   ;; via the OpenAI-compat surface). Passed through to the provider unchanged.
+   ;; :thinking — map like {:type "enabled"} or {:type "disabled"}
+   ;; :reasoning-effort — "high" | "max" (DeepSeek), "low" | "medium" | "high" (OpenAI)
+   [:thinking {:optional true} :any]
+   [:reasoning-effort {:optional true} :string]
+   ;; Raw provider response_format. Use this for JSON mode ({:type "json_object"})
+   ;; or provider-specific structured-output (Vertex's json_schema). For Malli-driven
+   ;; structured output prefer :schema, which uses the tool-call mechanism.
+   [:response-format {:optional true} :any]
+   ;; Retry config for transient HTTP failures (429, transient 5xx) and provider
+   ;; mid-stream pressure signals (e.g. DeepSeek's `insufficient_system_resource`
+   ;; finish_reason). Retry only fires before any event has been forwarded to
+   ;; the consumer — once a chunk has been emitted the stream is committed.
+   ;; Pass {:max-attempts 0} (or {:max-attempts 1}) to disable.
+   [:retry {:optional true}
+    [:map
+     [:max-attempts {:optional true} :int]
+     [:base-delay-ms {:optional true} :int]
+     [:max-delay-ms {:optional true} :int]]]
    [:provider-opts {:optional true} [:map-of :keyword :any]]
    [:on-text {:optional true} fn?]
    [:on-reasoning {:optional true} fn?]
@@ -64,9 +84,13 @@
              [:max-steps {:optional true} :int]
              [:stop-when {:optional true} fn?]]))
 
-;; Keys that get forwarded to the provider API (not consumed by clj-llm itself)
+;; Keys that get forwarded to the provider API (not consumed by clj-llm itself).
+;; All of these survive snake_case conversion at the backend boundary (see
+;; backend/openai.cljc convert-options-for-api), so kebab-case keys here become
+;; snake_case JSON fields automatically.
 (def ^:private api-forward-keys
-  #{:temperature :max-tokens :top-p})
+  #{:temperature :max-tokens :top-p
+    :thinking :reasoning-effort :response-format})
 
 (defn- parse-opts
   "Parse options against a malli schema. Returns a map with clj-llm keys
@@ -212,9 +236,11 @@
                   {:error-type :llm/invalid-request
                    :input input}))))
 
-(defn- provider-request-events
-  "Orchestrate request using LLMProvider protocol methods.
-   Returns core.async channel of events."
+(defn- provider-request-events-once
+  "Orchestrate one attempt at a provider request using LLMProvider protocol
+   methods. Returns a core.async channel of events for this single attempt.
+   No retry — see `events-with-retry` for the wrapper that retries on
+   transient errors."
   [provider request]
   (let [{:keys [model system-prompt messages schema tools tool-choice provider-opts]} request
         body-map (proto/build-body provider model system-prompt messages
@@ -236,6 +262,65 @@
                   (a/>! out-ch event))
                 (recur))))))
       out-ch)))
+
+(def ^:private default-retry
+  {:max-attempts 3 :base-delay-ms 500 :max-delay-ms 30000})
+
+(defn- retryable-event?
+  "True if v is a Throwable or an :error event flagged retryable.
+   Retryability is set by the HTTP layer (429 + transient 5xx) and by the
+   provider parse-chunk (e.g. DeepSeek's `insufficient_system_resource`
+   finish_reason)."
+  [v]
+  (cond
+    (throwable? v) (true? (:retryable? (ex-data v)))
+    (and (map? v) (= :error (:type v)))
+    (true? (get-in v [:error :retryable?]))
+    :else false))
+
+(defn- compute-backoff
+  "Exponential backoff with a hard ceiling. attempt is 1-indexed."
+  [base-delay-ms max-delay-ms attempt]
+  (let [exp #?(:clj  (Math/pow 2 (dec attempt))
+               :cljs (js/Math.pow 2 (dec attempt)))]
+    (long (min (double max-delay-ms) (* (double base-delay-ms) exp)))))
+
+(defn- provider-request-events
+  "Run a provider request with retry on transient errors. Retries only as long
+   as no event has been forwarded to the consumer — once a chunk has been
+   passed through, the stream is considered committed and further errors flow
+   through normally.
+
+   Retryable signals: HTTP 408 / 429 / 5xx (set by net+stream layer), provider
+   `:error` events with :retryable? true (e.g. DeepSeek insufficient_system_resource)."
+  [provider request]
+  (let [retry (merge default-retry (:retry request))
+        {:keys [max-attempts base-delay-ms max-delay-ms]} retry
+        out-ch (a/chan 256)]
+    (a/go
+      (loop [attempt 1]
+        (let [stream-ch     (provider-request-events-once provider request)
+              committed?    (atom false)
+              should-retry? (atom false)]
+          (loop []
+            (let [v (a/<! stream-ch)]
+              (cond
+                (nil? v) nil
+
+                (and (retryable-event? v)
+                     (not @committed?)
+                     (< attempt max-attempts))
+                (reset! should-retry? true)
+
+                :else
+                (do (reset! committed? true)
+                    (a/>! out-ch v)
+                    (recur)))))
+          (if @should-retry?
+            (do (a/<! (a/timeout (compute-backoff base-delay-ms max-delay-ms attempt)))
+                (recur (inc attempt)))
+            (a/close! out-ch)))))
+    out-ch))
 
 ;; ════════════════════════════════════════════════════════════════════
 ;; Core API
@@ -319,7 +404,7 @@
    :usage, :finish, :error, :done."
   ([provider input] (events provider {} input))
   ([provider opts input]
-   (let [{:keys [model system-prompt schema tools tool-choice provider-opts] :as parsed}
+   (let [{:keys [model system-prompt schema tools tool-choice provider-opts retry] :as parsed}
          (parse-opts (merge (:defaults provider) opts))
          _ (when-not model
              (throw (ex-info "No model specified"
@@ -328,7 +413,8 @@
        {:model model :system-prompt system-prompt
         :messages (build-messages input)
         :schema schema :tools tools :tool-choice tool-choice
-        :provider-opts (or provider-opts {})}))))
+        :provider-opts (or provider-opts {})
+        :retry retry}))))
 
 (defn- parse-tool-calls
   "Parse JSON argument strings in tool calls.
@@ -352,8 +438,11 @@
 
 (defn- tool-calls->assistant-message
   "Build the assistant message for tool call history round-tripping.
-   Includes :content when the model returned text alongside tool calls."
-  [tool-calls text]
+   Includes :content when the model returned text alongside tool calls.
+   Includes :reasoning-content when the model emitted reasoning — required
+   by DeepSeek's thinking-mode tool-call multi-turn contract; backends that
+   don't recognize the field will simply pass it through harmlessly."
+  [tool-calls text reasoning]
   (cond-> {:role :assistant
            :tool-calls (mapv (fn [{:keys [id name arguments]}]
                                {:id id :type "function"
@@ -362,7 +451,8 @@
                                                         arguments
                                                         (json-stringify arguments))}})
                              tool-calls)}
-    (seq text) (assoc :content text)))
+    (seq text)      (assoc :content text)
+    (seq reasoning) (assoc :reasoning-content reasoning)))
 
 (defn- resolve-tool-schema
   "Get the Malli function schema ([:=> ...] or [:-> ...]) from a tool.
@@ -692,7 +782,7 @@
   [{:keys [history steps step total-usage
            tools name->fn max-steps stop-when
            on-tool-calls on-tool-result]} result]
-  (let [{:keys [text usage]} result
+  (let [{:keys [text usage reasoning]} result
         parsed-calls (or (parse-tool-calls (:tool-calls result)) [])
         acc-usage (if (seq usage)
                     (merge-with (fn [a b] (if (and (number? a) (number? b)) (+ a b) b))
@@ -723,7 +813,7 @@
                             parsed-calls))
             tool-results (mapv :result results)
             assistant-msg (if results
-                            (tool-calls->assistant-message parsed-calls text)
+                            (tool-calls->assistant-message parsed-calls text reasoning)
                             {:role :assistant :content (or text "")})
             tool-msgs    (if results
                            (mapv (fn [{:keys [call result]}]

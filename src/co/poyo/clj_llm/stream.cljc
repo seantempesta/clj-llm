@@ -48,15 +48,24 @@
 ;; HTTP streaming
 ;; ════════════════════════════════════════════════════════════════════
 
+(def ^:private retryable-statuses
+  "HTTP status codes that should trigger a retry: 429 rate-limited, plus
+   transient 5xx upstream errors. 408 (Request Timeout) is included for
+   network-layer flakiness."
+  #{408 429 500 502 503 504})
+
 #?(:clj
    (defn- check-status!
-     "Throws ex-info for non-200 responses, draining the body for the message."
+     "Throws ex-info for non-200 responses, draining the body for the message.
+      Marks status codes in `retryable-statuses` with :retryable? true so the
+      retry wrapper in core can decide whether to re-attempt."
      [{:keys [^InputStream body status]}]
      (when (not= 200 status)
        (let [body-str (try (slurp body) (catch Exception _ nil))]
          (throw (ex-info (cond-> (str "HTTP " status)
                            body-str (str ": " body-str))
-                         (cond-> {:status status}
+                         (cond-> {:status status
+                                  :retryable? (boolean (retryable-statuses status))}
                            body-str (assoc :body body-str))))))))
 
 #?(:clj
