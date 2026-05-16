@@ -1,5 +1,7 @@
 # clj-llm
 
+> **Fork notice.** This is a personal fork of [minikomi/clj-llm](https://github.com/minikomi/clj-llm). It adds a ClojureScript / Node port: the source tree is single-`.cljc`, the CLJS HTTP transport uses native `js/fetch` (Node 18+), and `generate-promise` / `generate-ch` / `run-agent-promise` provide async entry points for JS-hosted runtimes. License unchanged: EPL-1.0 (see `LICENSE`).
+
 A Clojure library for talking to LLMs. Providers are plain maps. Results are plain maps. Everything composes with standard Clojure.
 
 ## Installation
