@@ -639,12 +639,11 @@
 
 #?(:clj
    (defn generate
-     "Blocking generation (Clojure / JVM). For ClojureScript, use
-      `generate-promise` instead — JavaScript has no blocking I/O. See its
-      docstring for full options + examples.
+     "Blocking generation (Clojure / JVM). For ClojureScript use `generate-promise`,
+      or for non-blocking JVM use `generate-ch`.
 
       (generate ai \"hello\")
-      ;; => {:text \"Hello!\" :usage {:prompt-tokens 5 :completion-tokens 10}}
+      ;; => {:text \"Hello!\" :usage {:prompt-tokens 5 :completion-tokens 10} :timings {...}}
 
       (generate ai {:schema person-schema} \"extract this\")
       ;; => {:text \"{...}\" :structured {:name \"Alice\" :age 30} :usage {...}}
@@ -655,24 +654,55 @@
       ;;     :tool-results [\"Sunny, 22C in Tokyo\"]
       ;;     :usage {...}}
 
-      Common options:
+      Core options:
         :model           - model name string
         :system-prompt   - system message string
-        :schema          - Malli schema for structured output
+        :schema          - Malli schema for structured output (uses tool-mode internally)
+        :tools           - vector of tool vars (functions with Malli :=> metadata)
+        :tool-choice     - \"none\" | \"auto\" | \"required\" | {:type \"function\" :function {:name ...}}
         :temperature     - float, e.g. 0.7
         :max-tokens      - int, max tokens to generate
         :top-p           - float, nucleus sampling
-        :provider-opts   - map of additional provider-specific API params
 
-      Callbacks (all optional):
+      Reasoning / thinking-mode (DeepSeek V4 Pro, OpenAI o-series, Gemini 3.x):
+        :thinking         - map controlling thinking-mode, e.g. {:type \"enabled\"} or {:type \"disabled\"}
+                            (DeepSeek). Pass-through, snake-cased.
+        :reasoning-effort - \"high\" | \"max\" (DeepSeek), \"low\" | \"medium\" | \"high\" (OpenAI).
+
+      Output shaping:
+        :response-format  - raw provider response_format, e.g. {:type \"json_object\"} for JSON
+                            mode. For Malli-driven structured output, prefer :schema instead.
+                            Both can coexist (schema uses tool-mode under the hood).
+
+      Reliability:
+        :retry           - retry config for transient HTTP errors (429, 408, 5xx) and provider
+                           mid-stream pressure signals (DeepSeek's insufficient_system_resource
+                           finish_reason). Defaults to
+                             {:max-attempts 3 :base-delay-ms 500 :max-delay-ms 30000}
+                           Retries fire ONLY before any event has been forwarded to the
+                           consumer — once a chunk has been emitted the stream is considered
+                           committed and later errors flow through. Pass {:max-attempts 1} to
+                           disable.
+
+      Escape hatch:
+        :provider-opts   - map of additional provider-specific API params. Kebab-case keys are
+                           snake-cased before sending. Wins over the first-class options above
+                           when keys collide.
+
+      Callbacks (all optional, all called from a background thread / goroutine):
         :on-text         - (fn [chunk] ...) called for each text chunk as it streams
+        :on-reasoning    - (fn [chunk] ...) called for each reasoning_content chunk (DeepSeek
+                           thinking-mode, OpenRouter \"reasoning\" channel)
         :on-tool-calls   - (fn [{:keys [tool-calls text]}] ...) called before tools execute
         :on-tool-result  - (fn [{:keys [tool-call result error]}] ...) called after each tool
 
-      Input is last — string, message-history vector, or a result map from
-      a previous call. Results auto-unwrap :text when chained.
+      Input is last — string, message-history vector, mixed content parts vector (for
+      multimodal — see co.poyo.clj-llm.content), or a result map from a previous call.
+      Result maps auto-unwrap :text when chained.
 
-      Results are plain maps — (:text result), (:usage result), etc."
+      Results are plain maps. Always present: :timings. Typically present: :text, :usage.
+      Conditional: :reasoning (when the model emitted thinking content), :structured (when
+      :schema was used), :tool-calls + :tool-results (when :tools were used)."
      ([provider input]
       (generate provider {} input))
      ([provider opts input]
@@ -865,15 +895,35 @@
 #?(:clj
    (defn run-agent
      "Run an agentic tool-calling loop (Clojure / JVM blocking).
-      For ClojureScript, use `run-agent-promise`.
+      For ClojureScript use `run-agent-promise`.
 
-      Tools are plain functions with standard Malli function schemas
-      attached via metadata.
+      Tools are plain functions with Malli function schemas attached via metadata
+      ({:malli/schema [:=> [:cat <input-map>] <return>]}). The loop alternates
+      provider calls with tool execution until the model stops calling tools or
+      :max-steps is reached.
 
       (run-agent ai {:tools [#'get-weather]} \"Weather in Tokyo?\")
       (run-agent ai {:tools [#'get-weather #'search] :max-steps 5} \"plan a trip\")
 
-      Returns {:text ... :history ... :steps [...] :tool-calls ... :usage ...}"
+      Agent-specific options (in addition to all `generate` options):
+        :tools     - REQUIRED non-empty vector of tool vars
+        :max-steps - max loop iterations, default 10. On exhaustion the result
+                     is returned with :truncated true.
+        :stop-when - (fn [{:keys [tool-calls text step tool-results]}] ...) →
+                     bool. Default: stop when no tool calls in this turn.
+
+      Reasoning round-trip: when the underlying model emits :reasoning-content
+      (DeepSeek thinking-mode), it is preserved on the assistant turn going
+      back to the API. Required by DeepSeek's tool-call thinking contract;
+      transparent on other backends.
+
+      Returns:
+        {:text <final-assistant-text>
+         :history [...]       — full message history including tool results
+         :steps [{...}]       — per-step :tool-calls + :tool-results
+         :tool-calls [...]    — last turn's tool calls (if any)
+         :usage {...}         — summed across all turns
+         :truncated true}     — present only when :max-steps was hit"
      ([provider input]
       (run-agent provider {} input))
      ([provider opts input]

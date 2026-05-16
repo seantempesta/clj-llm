@@ -6,8 +6,18 @@ A Clojure library for talking to LLMs. Providers are plain maps. Results are pla
 
 ## Installation
 
+Upstream:
+
 ```clojure
-{:deps {co.poyo/clj-llm {:git/url "https://github.com/poyo-ai/clj-llm"
+{:deps {co.poyo/clj-llm {:git/url "https://github.com/minikomi/clj-llm"
+                         :git/sha "..."}}}
+```
+
+This fork (CLJS port + Vertex backend + reasoning round-trip + retry layer):
+
+```clojure
+{:deps {co.poyo/clj-llm {:git/url "https://github.com/seantempesta/clj-llm"
+                         :git/tag "v0.2.0-cljs-port"
                          :git/sha "..."}}}
 ```
 
@@ -59,15 +69,68 @@ A provider is just a map. Put defaults on `:defaults`:
 (def careful (update ai :defaults merge {:model "gpt-4o" :temperature 0.2}))
 ```
 
-`api-key` can be a string, a zero-arg function (called on every request), or `false`.
+`api-key` can be a string, a zero-arg function (called on every request — useful for token refresh), or `false`.
 
 When no `:api-key` is provided, each backend reads from a default environment variable:
 
-| Backend | Env var |
-|---|---|
-| OpenAI | `OPENAI_API_KEY` |
-| Anthropic | `ANTHROPIC_API_KEY` |
-| OpenRouter | `OPENROUTER_KEY` |
+| Backend | Constructor | Env var | Notes |
+|---|---|---|---|
+| OpenAI | `openai/backend` | `OPENAI_API_KEY` | Also works for OpenAI-compatible providers (DeepSeek, OpenRouter, Together, Groq, Ollama, etc.) by overriding `:api-base` |
+| Anthropic | `anthropic/backend` | `ANTHROPIC_API_KEY` | Native Anthropic API |
+| OpenRouter | `openrouter/backend` | `OPENROUTER_API_KEY` | Native OpenRouter; for plain OpenAI-compat use `openai/backend` with OpenRouter's URL |
+| Vertex (Gemini) | `vertex/backend` (JVM only) | n/a — uses GCP ADC | See the Vertex section below |
+
+### DeepSeek
+
+Use the OpenAI backend with DeepSeek's base URL. The library handles DeepSeek's thinking-mode round-trip in agent loops correctly (reasoning content is preserved on the assistant turn — required by DeepSeek's contract).
+
+```clojure
+(def deepseek
+  (openai/backend
+    {:api-key  (System/getenv "DEEPSEEK_API_KEY")
+     :api-base "https://api.deepseek.com/v1"
+     :defaults {:model "deepseek-v4-flash"}}))   ; or "deepseek-v4-pro"
+
+(llm/generate deepseek "Say hi")
+
+;; Thinking-mode + reasoning effort (DeepSeek-specific knobs, first-class)
+(llm/generate deepseek
+              {:model "deepseek-v4-pro"
+               :thinking {:type "enabled"}
+               :reasoning-effort "high"}
+              "Plan a refactor")
+```
+
+### Vertex / Gemini (JVM only)
+
+Routes Gemini through Google Cloud Vertex AI's OpenAI-compatible endpoint with ADC bearer-token auth. Pick this over the public AI Studio endpoint when you can't have prompts used for training. Auth: `gcloud auth application-default login` once, then the library refreshes tokens automatically.
+
+```clojure
+(require '[co.poyo.clj-llm.backend.vertex :as vertex])
+
+(def gemini
+  (vertex/backend
+    {:project "my-gcp-project"               ; or set GOOGLE_CLOUD_PROJECT
+     :defaults {:model "gemini-3-flash-preview"}}))
+
+;; Chat
+(llm/generate gemini "Hello")
+
+;; Vision with a GCS URI — no download/encode round-trip
+(llm/generate gemini
+              [(content/text "What's in this image?")
+               (content/image "gs://my-bucket/photo.jpg")])
+
+;; Embeddings (native :predict endpoint, separate from the chat protocol)
+(vertex/embed gemini
+              {:model     "text-embedding-005"     ; or "gemini-embedding-001"
+               :inputs    ["doc 1" "doc 2"]
+               :task-type "RETRIEVAL_DOCUMENT"
+               :dimensions 768})
+;; => {:embeddings [[…] […]] :stats [{:token_count 5} …] :usage {:total-tokens 11}}
+```
+
+Model names are bare Gemini IDs (`"gemini-3-pro-preview"`). The library adds the `google/` publisher prefix Vertex requires. `:location` defaults to `"global"` — required for Gemini 3.x preview models as of mid-2026.
 
 ## Generate
 
@@ -87,7 +150,27 @@ Input is always last. Options go before it:
   "Explain recursion")
 ```
 
-For provider-specific params: `:provider-opts {:frequency_penalty 0.5}`.
+Full first-class options:
+
+| Option | Type | Notes |
+|---|---|---|
+| `:model` | string | model name |
+| `:system-prompt` | string | system message |
+| `:schema` | Malli schema | structured output via tool-mode (returns `:structured`) |
+| `:tools` | vector of vars | tool-calling — see Tool calling section |
+| `:tool-choice` | string/map | `"none"`, `"auto"`, `"required"`, or specific function |
+| `:temperature` | float | |
+| `:max-tokens` | int | |
+| `:top-p` | float | |
+| `:thinking` | map | DeepSeek thinking-mode, e.g. `{:type "enabled"}` |
+| `:reasoning-effort` | string | DeepSeek `"high"`/`"max"`, OpenAI `"low"`/`"medium"`/`"high"` |
+| `:response-format` | map | raw provider response_format, e.g. `{:type "json_object"}` for JSON mode. For Malli structured output prefer `:schema`. |
+| `:retry` | map | retry config — see Retries below |
+| `:provider-opts` | map | escape hatch for raw provider params (kebab-case is snake-cased automatically) |
+
+Callbacks: `:on-text`, `:on-reasoning`, `:on-tool-calls`, `:on-tool-result`.
+
+For provider-specific params not yet first-class: `:provider-opts {:frequency_penalty 0.5}` — keys are snake-cased before sending.
 
 ## Chaining
 
@@ -270,7 +353,55 @@ Connection errors throw plain Java exceptions. HTTP errors throw `ex-info` with 
     (println "Connection error:" (.getMessage e))))
 ```
 
-Option validation errors are `ex-info` with `:error-type :llm/invalid-request`. No automatic retries.
+Option validation errors are `ex-info` with `:error-type :llm/invalid-request`.
+
+## Retries
+
+The library auto-retries on transient failures: HTTP 408/429/5xx, connection errors, and provider mid-stream pressure signals like DeepSeek's `insufficient_system_resource` finish_reason.
+
+Retries fire **only before any event has been forwarded to the consumer** — once a chunk has been emitted (e.g., a streaming `:on-text` callback fired), the stream is considered committed and later errors flow through normally.
+
+```clojure
+;; Default config — used automatically:
+;;   {:max-attempts 3 :base-delay-ms 500 :max-delay-ms 30000}
+
+(llm/generate ai
+              {:retry {:max-attempts 5 :base-delay-ms 1000 :max-delay-ms 60000}}
+              "long-running task")
+
+;; Disable retries entirely:
+(llm/generate ai {:retry {:max-attempts 1}} "no-retry call")
+```
+
+Backoff is exponential, capped at `:max-delay-ms`.
+
+## ClojureScript / Node
+
+Same source tree, same API surface, async entry points:
+
+```clojure
+(require '[co.poyo.clj-llm.core :as llm]
+         '[co.poyo.clj-llm.backend.openai :as openai])
+
+(def ai (openai/backend
+          {:api-key (.. js/process -env -OPENAI_API_KEY)
+           :defaults {:model "gpt-4o-mini"}}))
+
+;; Promise (most JS-friendly)
+(-> (llm/generate-promise ai "hello")
+    (.then (fn [r] (println (:text r))))
+    (.catch (fn [e] (println "Error:" (.-message e)))))
+
+;; core.async channel (cross-platform, also works on JVM)
+(require '[clojure.core.async :as a])
+(a/go
+  (let [r (a/<! (llm/generate-ch ai "hello"))]
+    (if (instance? js/Error r)
+      (println "Error:" (.-message r))
+      (println (:text r)))))
+```
+
+The CLJS HTTP layer uses native `js/fetch` (Node 18+, no polyfill needed). The Vertex backend is JVM-only — token refresh from inside a sandboxed Node runtime is a host-RPC concern outside this library.
 
 ## Babashka
 
