@@ -1,12 +1,10 @@
 (ns co.poyo.clj-llm.backend.openai
   "OpenAI and OpenAI-compatible API provider implementation.
-   
+
    Supports OpenAI, OpenRouter, Together.ai, and any OpenAI-compatible endpoint."
   (:require
    [camel-snake-kebab.core :as csk]
    [camel-snake-kebab.extras :as cske]
-   [cheshire.core :as json]
-   [clojure.core.async :as a]
    [clojure.set]
    [co.poyo.clj-llm.schema :as schema]
    [co.poyo.clj-llm.protocol :as proto]
@@ -15,8 +13,13 @@
 (def ^:private default-config
   {:api-base "https://api.openai.com/v1"})
 
+(defn- getenv [k]
+  #?(:clj  (System/getenv k)
+     :cljs (when (and (exists? js/process) (.-env js/process))
+             (aget (.-env js/process) k))))
+
 (defn- default-api-key-fn []
-    (or (System/getenv "OPENAI_API_KEY")
+    (or (getenv "OPENAI_API_KEY")
         (throw (ex-info "No API key provided and OPENAI_API_KEY env var not set" {}))))
 
 (def ^:private ->snake-key (memoize csk/->snake_case_keyword))

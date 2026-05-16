@@ -1,0 +1,19 @@
+{:source-paths ["src" "test-cljs"]
+
+ :dependencies
+ [[org.clojure/core.async "1.8.741"]
+  [metosin/malli "0.20.1"]
+  [camel-snake-kebab "0.4.3"]]
+
+ :builds
+ {:test-deepseek
+  {:target           :node-script
+   :main             co.poyo.clj-llm-test.deepseek/-main
+   :output-to        "out/test-deepseek.js"
+   :compiler-options {:warnings-as-errors false}}
+
+  :smoke
+  {:target           :node-script
+   :main             co.poyo.clj-llm-test.smoke/-main
+   :output-to        "out/smoke.js"
+   :compiler-options {:warnings-as-errors false}}}}

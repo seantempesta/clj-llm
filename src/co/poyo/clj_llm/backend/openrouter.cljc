@@ -9,8 +9,13 @@
 (def ^:private default-api-base "https://openrouter.ai/api/v1")
 (def ^:private default-model "minimax/minimax-m2.5")
 
+(defn- getenv [k]
+  #?(:clj  (System/getenv k)
+     :cljs (when (and (exists? js/process) (.-env js/process))
+             (aget (.-env js/process) k))))
+
 (defn- default-api-key-fn []
-  (or (System/getenv "OPENROUTER_KEY")
+  (or (getenv "OPENROUTER_KEY")
       (throw (ex-info "No API key provided and OPENROUTER_KEY env var not set" {}))))
 
 (defn backend

@@ -32,3 +32,9 @@ working.org
 .chat-data/
 .tasks/
 *.html
+
+# CLJS port: shadow-cljs + Node build artifacts
+node_modules/
+.shadow-cljs/
+out/
+package-lock.json

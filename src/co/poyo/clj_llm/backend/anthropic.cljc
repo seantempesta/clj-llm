@@ -3,24 +3,31 @@
   (:require
    [camel-snake-kebab.core :as csk]
    [camel-snake-kebab.extras :as cske]
-   [cheshire.core :as json]
-   [clojure.core.async :as a]
    [clojure.set]
    [clojure.string :as str]
    [malli.core :as m]
    [co.poyo.clj-llm.schema :as schema]
    [co.poyo.clj-llm.protocol :as proto]
-   [co.poyo.clj-llm.stream :as stream]))
+   [co.poyo.clj-llm.stream :as stream]
+   #?(:clj [cheshire.core :as json])))
 
 (def ^:private default-config
   {:api-base "https://api.anthropic.com"
    :api-version "2023-06-01"})
 
+(defn- getenv [k]
+  #?(:clj  (or (System/getenv k) (System/getProperty k))
+     :cljs (when (and (exists? js/process) (.-env js/process))
+             (aget (.-env js/process) k))))
+
+(defn- json-parse-keywordize [s]
+  #?(:clj  (json/parse-string s true)
+     :cljs (js->clj (js/JSON.parse s) :keywordize-keys true)))
+
 (defn- default-api-key-fn
   "Default: read API key from ANTHROPIC_API_KEY env var."
   []
-  (or (System/getenv "ANTHROPIC_API_KEY")
-      (System/getProperty "ANTHROPIC_API_KEY")
+  (or (getenv "ANTHROPIC_API_KEY")
       (throw (ex-info "No API key provided and ANTHROPIC_API_KEY env var not set" {}))))
 
 (def ^:private ->snake-key (memoize csk/->snake_case_keyword))
@@ -85,8 +92,8 @@
                                              :name (get-in tc [:function :name])
                                              :input (let [args (get-in tc [:function :arguments])]
                                                       (if (string? args)
-                                                        (try (json/parse-string args true)
-                                                             (catch Exception _ {}))
+                                                        (try (json-parse-keywordize args)
+                                                             (catch #?(:clj Exception :cljs :default) _ {}))
                                                         (or args {})))})
                                           (:tool_calls msg))
                     text-block (when (seq (:content msg))
@@ -237,9 +244,10 @@
     (or api-version (:api-version default-config))
     (or defaults {}))))
 
-(defmethod print-method AnthropicBackend [b writer]
-  (let [model (get-in b [:defaults :model])]
-    (.write writer "#Anthropic")
-    (when model
-      (.write writer (str " " (pr-str model))))
-    (.write writer (str " " (pr-str (:api-base b))))))
+#?(:clj
+   (defmethod print-method AnthropicBackend [b writer]
+     (let [model (get-in b [:defaults :model])]
+       (.write writer "#Anthropic")
+       (when model
+         (.write writer (str " " (pr-str model))))
+       (.write writer (str " " (pr-str (:api-base b)))))))

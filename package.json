@@ -1,0 +1,13 @@
+{
+  "name": "clj-llm-cljs-tests",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Shadow-cljs harness for testing the clj-llm CLJS port. Not published.",
+  "scripts": {
+    "test:smoke": "shadow-cljs compile smoke && node out/smoke.js",
+    "test:deepseek": "shadow-cljs compile test-deepseek && node out/test-deepseek.js"
+  },
+  "devDependencies": {
+    "shadow-cljs": "^2.28.20"
+  }
+}
