@@ -40,6 +40,13 @@
        (or (str/starts-with? ^String x "http://")
            (str/starts-with? ^String x "https://"))))
 
+(defn- gs-url-string?
+  "True for Google Cloud Storage URIs. Vertex AI accepts these directly on
+   its OpenAI-compat surface — no download/encode round-trip needed."
+  [x]
+  (and (string? x)
+       (str/starts-with? ^String x "gs://")))
+
 #?(:clj
    (defn- download-url->temp-file
      ^File [url]
@@ -104,6 +111,11 @@
          :source     :base64
          :media-type opts-or-media-type
          :data       (bytes-util/bytes->base64 source)}
+
+        ;; GCS URI — pass through verbatim. Vertex's OpenAI-compat surface
+        ;; accepts gs:// directly; resize is not supported on GCS objects here.
+        (gs-url-string? source)
+        {:type :image :source :url :url source}
 
         ;; URL source
         (url-string? source)

@@ -3,7 +3,11 @@
         cheshire/cheshire {:mvn/version "6.1.0"}
         metosin/malli {:mvn/version "0.20.1"}
         camel-snake-kebab/camel-snake-kebab {:mvn/version "0.4.3"}
-        org.clojure/core.async {:mvn/version "1.8.741"}}
+        org.clojure/core.async {:mvn/version "1.8.741"}
+        ;; Required only by co.poyo.clj-llm.backend.vertex (JVM-only). ADC
+        ;; token-refresh path for Google Cloud Vertex AI. If you don't load
+        ;; the vertex backend the classes are dormant on the classpath.
+        com.google.auth/google-auth-library-oauth2-http {:mvn/version "1.27.0"}}
 
 
  
